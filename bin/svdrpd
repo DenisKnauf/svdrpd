@@ -1,0 +1,263 @@
+#!/usr/bin/ruby
+
+require 'socket'
+require 'syslog'
+require 'select'
+
+module Kernel
+	def debug line
+		STDOUT.puts "#{caller[0]}: #{line}"
+	end
+end
+
+class SVDRPC <Select::Socket
+	def initialize opts
+		opts.update( :delimiter => /\r?\n/)
+		@vdr = opts[ :vdr] || raise( ArgumentError, "need VDR")
+		super opts
+		@sock.puts "220 #{ENV["HOSTNAME"]} SVDRP svdrpd 0.0.1; #{Time.now}"
+	end
+
+	def event_line line
+		if /^\s*quit/i.match line
+			self.quit "quit"
+		else
+			@vdr.push self, line
+		end
+	end
+
+	def event_write *args
+		self.close if super( *args).empty? && @quit
+	end
+
+	def quit reason = "unknown reason"
+		@sock.close_read
+		@select.del @sock, :read
+		@quit = true
+		puts "221 #{ENV["HOSTNAME"]} closing connection (#{reason})"
+	rescue IOError
+	end
+end
+
+class SVDRPD <Select::Server
+	def initialize opts
+		@vdr = opts[ :vdr] || raise( ArgumentError, "need VDR")
+		super opts
+	end
+
+	def event_new_client sock
+		{ :vdr => @vdr, :clientclass => SVDRPC }
+	end
+
+	def quit reason = "unknown reason"
+		self.close
+		@clients.each do |i|
+			i.quit reason
+		end
+	end
+end
+
+class VDR
+	Request = Struct.new :client, :str
+	attr_reader :sock, :serv, :port, :select, :firstline
+
+	def initialize host = 'localhost', port = 2001, select = Select.new
+		@host, @port, @select = host, port, select
+		@quit, @queue = false, []
+	end
+
+	def closed?
+		@sock.nil? || @sock.closed?
+	end
+
+	def disconnect
+		@sock.close  unless @sock.nil?
+	end
+	alias :close :disconnect
+
+	def connect
+		@sock = VDR::Socket.new :sock => TCPSocket.new( serv, port), :select => @select, :parent => self
+		@answer = FirstLine.new
+	rescue Errno::ECONNREFUSED
+		retry
+	end
+
+	def event_answer line
+		# Kernel.debug "@answer=#{@answer}"
+		l = /^(\d\d\d)([ -])(.*?)[\n\r]*$/.match line
+		if l.nil?
+			# Kernel.debug "i don't understand this line: #{line}"
+			return
+		elsif l[ 1].to_i == 221
+		else
+			@answer.client.puts l[ 1..-1].to_s
+			self.next true if l[ 2] == ' '
+		end
+	end
+
+	def event_client_closed client
+		@queue.unshift @answer  unless @answer.nil?
+		@firstline = @sock = nil
+		self.next  unless @queue.empty?
+	end
+
+	def next clear_answer = false
+		# Kernel.debug "@queue = [#{@queue.collect{|i|i.to_s}.join ", "}]; @answer = #{@answer.inspect}"
+		@answer = nil  if clear_answer
+		return self.close  if @quit
+		return @answer  if @answer
+		begin
+			@answer = @queue.shift
+		end  while !@answer.nil? && @answer.client.closed?
+		if @answer.nil?
+		elsif self.closed?
+			@queue.unshift @answer
+			self.connect
+		else
+			@sock.puts @answer.str
+		end
+		@answer
+	end
+
+	def push client, str
+		r = Request.new client, str.strip
+		raise "Not a valid String: #{r.str.inject}"  if !r.str.kind_of?( String) || r.str.empty?
+		@queue.unshift r
+		self.next
+	end
+
+	def quit
+		unless self.closed?
+			q = Class.new
+			class <<q
+				def client; self; end
+				def closed?; false; end
+				def str; "quit"; end
+			end
+			@queue.unshift q
+			self.next
+		end
+		@quit = true
+		self.closed?
+	end
+end
+
+class VDR::Socket <Select::Socket
+	def initialize opts
+		opts.update( :delimiter => /\r?\n/)
+		super opts
+	end
+
+	def event_line line
+		@parent.event_answer line
+	end
+
+	def quit
+		@sock.puts "quit"
+	end
+end
+
+class VDR::FirstLine
+	attr_reader :line, :client, :str
+
+	def initialize
+		@client = self
+		@str = nil
+	end
+
+	def write line
+		@line = line
+	end
+
+	alias :print :write
+	alias :puts :write
+	alias :to_s :line
+end
+
+###############################################################################
+# debug #######################################################################
+###############################################################################
+if %W{-D --debug}.include? ARGV[0]
+	ARGV.shift
+	$DEBUG = true
+end
+$DEBUG = true  if ENV['DEBUG']
+
+if $DEBUG
+	def debug_func c, f
+		ff = case f
+			when /^(.*)\?$/	then "#{$1}_f"
+			when /^(.*)\!$/	then "#{$1}_a"
+			when "<<"		then "_s"
+			when "+"		then "_p"
+			when "-"		then "_m"
+			when "@+"		then "_P"
+			when "@-"		then "_M"
+			else "#{f}_n"
+			end
+		wf = "__wrapped_#{c.object_id.to_s.sub /^-/, "x"}_#{ff}__".intern
+		return "#{c}##{wf} already exists"  if c.instance_methods.include? wf
+		pre = "\#{\"%x\"%self.hash.abs}:#{c}##{f}"
+		c.class_eval <<-EOF
+			alias :#{wf} :#{f}
+			def #{f} *args, &e
+				ret = if e
+						STDERR.puts "==>#{pre} \#{args.collect {|i| i.inspect }.join ", "}, &\#{e.inspect}"
+						#{wf} *args, &e
+					else
+						STDERR.puts "==>#{pre} \#{args.collect {|i| i.inspect }.join ", "}"
+						#{wf} *args
+					end
+				#STDERR.puts "<==#{pre}"
+				ret
+			rescue
+				STDERR.puts "<==#{pre} EXCEPTION: \#{$!.inspect}"
+				Kernel.raise
+			end
+		EOF
+	end
+
+	def debug_class c, fs
+		c.instance_methods.grep fs do |f|
+			debug_func c, f
+		end
+	end
+
+	debug_class Select, /_set|_del$/
+	debug_class Select::Socket, /^event_.*|write|print|init|close$/
+	debug_class Select::Server, /^event_.*|close|init$/
+	debug_class VDR, /^event_.*|next|push|connect|close|disconnect$/
+	debug_class VDR::Socket, /^event_.*|close|init$/
+	debug_class SVDRPD, /^event_.*|init$/
+	debug_class SVDRPC, /^event_.*|init$/
+	debug_class VDR::FirstLine, /^write|print|puts$/
+end
+
+###############################################################################
+# main ########################################################################
+###############################################################################
+opts = {
+	:vdraddr  => ARGV[0] || 'localhost',
+	:vdrport  => ARGV[1] || 2002,
+	:servaddr => ARGV[2] || 'localhost',
+	:servport => ARGV[3] || 2001
+}
+
+Syslog.open 'svdrpd', Syslog::LOG_NDELAY | Syslog::LOG_PERROR,
+		Syslog::LOG_DAEMON
+
+begin
+	$select = Select.new
+	$select.timeout 5*60
+
+	$vdr = VDR.new opts[ :vdraddr], opts[ :vdrport], $select
+	$serv = SVDRPD.new :vdr => $vdr, :sock => TCPServer.new( opts[ :servaddr], opts[ :servport]), :select => $select
+	$select.exit_on_empty = true
+
+	$serv.run
+rescue Object
+	Syslog.err "#{$!} (#{$!.class}) -- #{$!.backtrace.join ' -- '}"
+	$serv.quit "server shuting down"
+	$vdr.quit
+	retry
+end
