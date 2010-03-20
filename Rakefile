@@ -10,8 +10,8 @@ begin
     gem.email = "Denis.Knauf@gmail.com"
     gem.homepage = "http://github.com/DenisKnauf/svdrpd"
     gem.authors = ["Denis Knauf"]
-    gem.files = ["README.md", "VERSION", "bin/**/*", "lib/**/*.rb", "test/**/*.rb"]
-    gem.require_paths = ["bin"]
+    gem.files = %w[README.md VERSION bin/**/* lib/**/*.rb test/**/*.rb]
+    gem.require_paths = %w[bin]
 		gem.add_dependency 'select'
   end
   Jeweler::GemcutterTasks.new
